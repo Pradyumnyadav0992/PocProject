@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: poc-project
+  labels:
+    app: poc-project
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: poc-project
+  template:
+    metadata:
+      labels:
+        app: poc-project
+    spec:
+      containers:
+      - name: pandacloud-container
+        image: 963665911471.dkr.ecr.us-east-1.amazonaws.com/poc-project:v1.0.0
+        ports:
+        - containerPort: 3000
+
+
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: poc-project
+  labels:
+    app: poc-project
+spec:
+  ports:
+  - name: http
+    port: 3000
+    protocol: TCP
+    targetPort: 3000
+  selector:
+    app: poc-project
+  type: LoadBalancer

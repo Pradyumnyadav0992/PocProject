@@ -1,0 +1,211 @@
+
+def changedFiles = []
+
+pipeline{
+
+    agent {
+        node {
+        label 'Slave_node1'
+        customWorkspace '/home/ubuntu/jenkins_workspace/' 
+        }
+    }
+	
+	tools {
+    nodejs 'NodeJS16.20'
+    sonarScanner 'SonarQube Scanner'
+}
+
+	
+    environment {
+				  SONARQUBE_TOKEN  = credentials('sonar-token')
+                  AWS_REGION = 'us-east-1'
+                  ECR_REGISTRY='963665911471.dkr.ecr.us-east-1.amazonaws.com/poc-project'
+
+    }
+
+    stages{
+
+        stage("Checkout and Version Update") {
+            steps {
+                git branch: 'main', url: 'https://github.com/Pradyumnyadav0992/PocProject.git'
+                script {
+
+                    // Get the latest tag 
+                    def latestTag = sh(script: "git describe --tags --abbrev=0", returnStdout: true).trim()
+                    echo "Latest tag: ${latestTag}"
+
+                    // Remove 'v' and split version
+                    def version = latestTag.replace("v", "").split("\\.")
+                    def major = version[0].toInteger()
+                    def minor = version[1].toInteger()
+                    def patch = version[2].toInteger()
+
+                    // Get latest commit message
+                    def commitMsgRaw = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+                    def commitMsg = commitMsgRaw.toLowerCase()
+                    echo "Latest commit message: ${commitMsgRaw}"
+
+                    // Decide which version part to bump  
+                    if (commitMsg.contains("breaking:")) {
+                        major += 1
+                        minor = 0
+                        patch = 0
+                    } else if (commitMsg.startsWith("feat:")) {
+                        minor += 1
+                        patch = 0
+                    } else if (commitMsg.startsWith("fix:")) {
+                        patch += 1
+                    } else {
+                        error("No version bump keywords found. Keeping existing version.")
+                       
+                       
+                    }
+
+                    // Build new tag
+                    def newVersion = "v${major}.${minor}.${patch}"
+                    echo "New version tag: ${newVersion}"
+
+                    // Set environment variable for later steps
+					env.OLDVERSION=version
+                    env.VERSION = newVersion
+                    
+
+                }
+            }
+        }
+    
+ 
+
+        stage("File change List"){
+        steps {
+            script {
+                changedFiles = sh(script: 'git diff --name-only $(git describe --tags --abbrev=0)..HEAD', returnStdout: true).trim().split("\n")
+                env.FILECHANGELIST = changedFiles
+                echo "Changed files:\n" + changedFiles.collect { "  - ${it}" }.join("\n")
+                // Exit if non relevent files is committed 
+                //if (!changedFiles.any { it.contains("src/") }) {  
+                //     error("No changes detected in 'src'. Failing the build.")
+                //}
+
+
+            }
+        }
+
+        }
+		
+		
+		
+stage('SonarQube Analysis') {
+    steps {
+        withSonarQubeEnv('Sonarqube') {
+            sh '''
+                ${tool 'SonarQube Scanner'}/bin/sonar-scanner \
+                -Dsonar.projectKey=my-project \
+                -Dsonar.sources=. \
+                -Dsonar.host.url=http://44.211.194.7:9000 \
+                -Dsonar.login=$SONARQUBE_TOKEN
+            '''
+        }
+    }
+
+        
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 1, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+		
+		stage('Build') {
+            steps {
+				script{
+                sh """
+				IMAGE_VERSION="${env.VERSION}"
+				docker build -t ${env.ECR_REGISTRY}:\$IMAGE_VERSION .
+				"""
+				}
+            }
+        }
+
+
+
+        stage("Image Scan"){
+		
+                steps {
+                    script{
+                       sh """
+							IMAGE_VERSION="${env.VERSION}"									
+                           trivy image  --exit-code 0 --severity HIGH,CRITICAL --format json -o "trivy-report-${svc}.json" "${env.ECR_REGISTRY}:\$IMAGE_VERSION"
+						   
+                          """
+						   
+                       // Archive the report file as a build artifact
+                       archiveArtifacts artifacts: "trivy-report-${svc}.json", fingerprint: true
+
+                            }
+                        }
+                           
+        }
+
+
+	 stage('8. Docker push') {
+            steps {
+                withCredentials([string(credentialsId: 'access-key', variable: 'AWS_ACCESS_KEY'), 
+                                 string(credentialsId: 'secret-key', variable: 'AWS_SECRET_KEY')]) {
+                    sh """
+					
+					IMAGE_VERSION="${env.VERSION}"
+					docker build -t ${env.ECR_REGISTRY}:\$IMAGE_VERSION .
+                    aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${env.ECR_REGISTRY}
+					docker push ${env.ECR_REGISTRY}:\$IMAGE_VERSION
+                    """
+                }
+            }
+        }
+        
+
+        stage('10. Cleanup Images') {
+            steps {
+			
+			script{
+                sh """
+                docker rmi ${env.ECR_REGISTRY}:\$IMAGE_VERSION
+				docker images
+                """
+				}
+            }
+        }
+	 
+	 
+	 
+	 
+    
+
+        stage("Update Manifest"){
+             steps {
+                      script{
+
+
+                                withCredentials([usernamePassword(credentialsId: 'your-github-creds-id', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_TOKEN')]) {
+                                    sh """
+                                        sed -i 's|${env.OLDVERSION}|${env.VERSION}|g' ./kubernetes//deploy.yaml
+                                        git add ./kubernetes/deploy.yaml
+                                        git commit -m "Manifest file updated for ./kubernetes/deploy.yaml"
+
+                                        """
+                                      sh  'git remote set-url origin https://\$GIT_USERNAME:\$GIT_TOKEN@github.com/\$GIT_USERNAME/ECOMMERCE.git'
+                                      sh  'git push --set-upstream origin main'
+                                        }
+
+                                        }
+										echo "Manifested files Updated Succeessfully"
+                                }
+
+                                
+                      }
+					  
+					  
+             }
+        }
+
